@@ -70,11 +70,16 @@ def hybrid_rrf_search(query, chunks, top_k=3, k=60):
 
 def generate_llm_answer(query, context, hf_api_key=""):
     """Generates an answer using Hugging Face Inference API or falls back to extractive response."""
+    
+    # Check Streamlit Secrets if no key is entered in the sidebar UI
+    if not hf_api_key and "HF_API_KEY" in st.secrets:
+        hf_api_key = st.secrets["HF_API_KEY"]
+
     if hf_api_key.strip():
-        API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+        API_URL = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
         headers = {"Authorization": f"Bearer {hf_api_key.strip()}"}
         
-        prompt = f"""<s>[INST] You are an academic assistant. Answer the question concise and accurately based ONLY on the provided context.
+        prompt = f"""<s>[INST] You are an academic assistant. Answer the question concisely and accurately based ONLY on the provided context.
 
 Context:
 {context}
@@ -93,7 +98,7 @@ Question: {query} [/INST]"""
                 if isinstance(result, list) and "generated_text" in result[0]:
                     return result[0]["generated_text"].split("[/INST]")[-1].strip()
         except Exception:
-            pass  # Fall back to local synthesis if API fails or times out
+            pass  # Fall back to local synthesis if API call fails or times out
 
     # Rule-Based / Fallback Summary Generation if API key is not provided or fails
     sentences = [s.strip() for s in context.split('.') if len(s.strip()) > 10]
