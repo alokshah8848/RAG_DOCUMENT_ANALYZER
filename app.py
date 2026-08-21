@@ -1,12 +1,13 @@
-import re
-import requests
-import fitz  # PyMuPDF
-import numpy as np
 import streamlit as st
+import fitz  # PyMuPDF
+import pdfplumber
+import numpy as np
+import requests
+import unicodedata
 from rank_bm25 import BM25Okapi
-from rouge_score import rouge_scorer
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+from rouge_score import rouge_scorer
 
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION & MODEL INITIALIZATION
@@ -18,7 +19,6 @@ st.caption("Powered by BM25 + FAISS Vector Search, LLM Generation & Citation Val
 
 @st.cache_resource
 def load_embedder():
-    # Dense embedding model for semantic search & metrics evaluation
     return SentenceTransformer("BAAI/bge-small-en-v1.5")
 
 embedder = load_embedder()
@@ -26,32 +26,70 @@ embedder = load_embedder()
 # -----------------------------------------------------------------------------
 # 2. HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
+def clean_extracted_text(text):
+    """Normalizes unicode and removes non-printable / replacement character artifacts."""
+    if not text:
+        return ""
+    # Normalize unicode representations
+    normalized = unicodedata.normalize("NFKD", text)
+    # Strip non-printable bytes and replacement symbols (\ufffd / diamond ?)
+    cleaned = "".join(ch for ch in normalized if ch.isprintable() or ch in ['\n', ' '])
+    return cleaned.replace("\ufffd", "").replace("", "").strip()
+
 def parse_and_chunk_pdf(uploaded_file, chunk_size=512, chunk_overlap=64):
-    """Extracts text from PDF, cleans encoding artifacts, and splits into chunk dictionaries."""
-    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    """
+    Extracts text using pdfplumber to bypass font CMap errors.
+    Falls back to PyMuPDF with text cleaning if pdfplumber returns empty content.
+    """
     chunks = []
     
-    for page_num in range(len(doc)):
-        text = doc[page_num].get_text("text")
+    # Reset stream pointer
+    uploaded_file.seek(0)
+    
+    # Primary Method: pdfplumber
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                raw_text = page.extract_text() or ""
+                clean_text = clean_extracted_text(raw_text)
+                
+                words = clean_text.split()
+                if len(words) > 5:
+                    for i in range(0, len(words), chunk_size - chunk_overlap):
+                        chunk_text = " ".join(words[i:i + chunk_size])
+                        if len(chunk_text.strip()) > 20:
+                            chunks.append({
+                                "text": chunk_text,
+                                "page": page_num + 1,
+                                "id": f"p{page_num+1}_c{i}"
+                            })
+    except Exception:
+        pass
+
+    # Fallback Method: PyMuPDF Block Extraction
+    if not chunks:
+        uploaded_file.seek(0)
+        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
         
-        # Strip non-ASCII/garbage characters
-        cleaned_text = re.sub(r'[^\x00-\x7F]+', ' ', text)
-        # Normalize whitespace
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-        
-        words = cleaned_text.split()
-        for i in range(0, len(words), chunk_size - chunk_overlap):
-            chunk_text = " ".join(words[i:i + chunk_size])
-            if len(chunk_text.strip()) > 20:
-                chunks.append({
-                    "text": chunk_text,
-                    "page": page_num + 1,
-                    "id": f"p{page_num+1}_c{i}"
-                })
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            blocks = page.get_text("blocks")
+            raw_text = "\n".join([b[4] for b in blocks if len(b) > 4 and b[4].strip()])
+            clean_text = clean_extracted_text(raw_text)
+            
+            words = clean_text.split()
+            for i in range(0, len(words), chunk_size - chunk_overlap):
+                chunk_text = " ".join(words[i:i + chunk_size])
+                if len(chunk_text.strip()) > 20:
+                    chunks.append({
+                        "text": chunk_text,
+                        "page": page_num + 1,
+                        "id": f"p{page_num+1}_c{i}"
+                    })
+
     return chunks
 
 def hybrid_rrf_search(query, chunks, top_k=3, k=60):
-    """ Combines BM25 (Lexical) and Dense Vector (Semantic) Search using Reciprocal Rank Fusion."""
     corpus_texts = [c["text"] for c in chunks]
     
     # Sparse BM25 Search
@@ -66,7 +104,7 @@ def hybrid_rrf_search(query, chunks, top_k=3, k=60):
     dense_scores = cosine_similarity(query_vec, doc_vecs)[0]
     dense_top = np.argsort(dense_scores)[::-1][:top_k * 2]
     
-    # Reciprocal Rank Fusion (RRF)
+    # Reciprocal Rank Fusion
     rrf_scores = {}
     for rank, idx in enumerate(bm25_top):
         rrf_scores[idx] = rrf_scores.get(idx, 0) + 1.0 / (k + rank + 1)
@@ -77,17 +115,10 @@ def hybrid_rrf_search(query, chunks, top_k=3, k=60):
     return [chunks[idx] for idx, score in sorted_indices]
 
 def generate_llm_answer(query, context, hf_api_key=""):
-    """Generates an answer using Hugging Face Inference API or falls back to extractive response."""
-    
-    # Safely check Streamlit Secrets without crashing on local environments
-    if not hf_api_key:
-        try:
-            if "HF_API_KEY" in st.secrets:
-                hf_api_key = st.secrets["HF_API_KEY"]
-        except Exception:
-            pass  # Secrets file doesn't exist locally; proceed to fallback
+    if not hf_api_key and "HF_API_KEY" in st.secrets:
+        hf_api_key = st.secrets["HF_API_KEY"]
 
-    if hf_api_key and hf_api_key.strip():
+    if hf_api_key.strip():
         API_URL = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
         headers = {"Authorization": f"Bearer {hf_api_key.strip()}"}
         
@@ -110,9 +141,8 @@ Question: {query} [/INST]"""
                 if isinstance(result, list) and "generated_text" in result[0]:
                     return result[0]["generated_text"].split("[/INST]")[-1].strip()
         except Exception:
-            pass  # Fall back to local synthesis if API call fails or times out
+            pass
 
-    # Rule-Based / Fallback Summary Generation if API key is not provided or fails
     sentences = [s.strip() for s in context.split('.') if len(s.strip()) > 10]
     top_sentences = sentences[:3] if len(sentences) >= 3 else sentences
     return f"Based on the retrieved context: {' '.join(top_sentences)}."
@@ -121,7 +151,7 @@ Question: {query} [/INST]"""
 # 3. USER INTERFACE & MAIN APPLICATION LOGIC
 # -----------------------------------------------------------------------------
 st.sidebar.header("⚙️ Configuration")
-hf_api_key = st.sidebar.text_input("Hugging Face API Key (Optional)", type="password", help="Enter free HF token to enable full LLM generation.")
+hf_api_key = st.sidebar.text_input("Hugging Face API Key (Optional)", type="password")
 
 st.sidebar.header("📁 Document Upload")
 uploaded_file = st.sidebar.file_uploader("Upload a PDF document", type=["pdf"])
@@ -129,29 +159,28 @@ uploaded_file = st.sidebar.file_uploader("Upload a PDF document", type=["pdf"])
 if uploaded_file:
     with st.spinner("Processing & Indexing PDF..."):
         chunks = parse_and_chunk_pdf(uploaded_file)
-        st.sidebar.success(f"Successfully indexed {len(chunks)} text chunks!")
+        if len(chunks) > 0:
+            st.sidebar.success(f"Successfully indexed {len(chunks)} text chunks!")
+        else:
+            st.sidebar.error("Could not extract readable text. Document might be scanned or image-only.")
 
     query = st.text_input("Enter your question about the document:")
     
-    if query:
-        # Step 1: Perform Hybrid Search
+    if query and len(chunks) > 0:
         retrieved_chunks = hybrid_rrf_search(query, chunks, top_k=3)
         best_context = retrieved_chunks[0]['text']
         
-        # Step 2: Generate Answer
         with st.spinner("Generating answer..."):
             generated_answer = generate_llm_answer(query, best_context, hf_api_key)
         
         st.subheader("🤖 Generated Answer")
         st.info(generated_answer)
         
-        # Step 3: Display Citations
         st.subheader("🔍 Retrieved Citations & Context")
         for idx, chunk in enumerate(retrieved_chunks):
             with st.expander(f"Source Chunk #{idx+1} (Page {chunk['page']})", expanded=(idx == 0)):
                 st.write(chunk['text'])
         
-        # Step 4: Evaluate Metrics (Answer vs. Retrieved Context)
         scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
         rouge_l = scorer.score(best_context, generated_answer)['rougeL'].fmeasure
         
