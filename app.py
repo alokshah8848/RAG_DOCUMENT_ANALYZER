@@ -71,11 +71,15 @@ def hybrid_rrf_search(query, chunks, top_k=3, k=60):
 def generate_llm_answer(query, context, hf_api_key=""):
     """Generates an answer using Hugging Face Inference API or falls back to extractive response."""
     
-    # Check Streamlit Secrets if no key is entered in the sidebar UI
-    if not hf_api_key and "HF_API_KEY" in st.secrets:
-        hf_api_key = st.secrets["HF_API_KEY"]
+    # Safely check Streamlit Secrets without crashing when running locally
+    if not hf_api_key:
+        try:
+            if "HF_API_KEY" in st.secrets:
+                hf_api_key = st.secrets["HF_API_KEY"]
+        except Exception:
+            pass  # Secrets file doesn't exist locally; proceed to fallback
 
-    if hf_api_key.strip():
+    if hf_api_key and hf_api_key.strip():
         API_URL = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
         headers = {"Authorization": f"Bearer {hf_api_key.strip()}"}
         
