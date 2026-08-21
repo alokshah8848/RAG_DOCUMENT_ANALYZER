@@ -1,11 +1,12 @@
-import streamlit as st
+import re
+import requests
 import fitz  # PyMuPDF
 import numpy as np
-import requests
+import streamlit as st
 from rank_bm25 import BM25Okapi
+from rouge_score import rouge_scorer
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from rouge_score import rouge_scorer
 
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION & MODEL INITIALIZATION
@@ -26,12 +27,19 @@ embedder = load_embedder()
 # 2. HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def parse_and_chunk_pdf(uploaded_file, chunk_size=512, chunk_overlap=64):
-    """Extracts text from PDF and splits it into chunk dictionaries with page metadata."""
+    """Extracts text from PDF, cleans encoding artifacts, and splits into chunk dictionaries."""
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     chunks = []
+    
     for page_num in range(len(doc)):
         text = doc[page_num].get_text("text")
-        words = text.split()
+        
+        # Strip non-ASCII/garbage characters
+        cleaned_text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+        # Normalize whitespace
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        
+        words = cleaned_text.split()
         for i in range(0, len(words), chunk_size - chunk_overlap):
             chunk_text = " ".join(words[i:i + chunk_size])
             if len(chunk_text.strip()) > 20:
@@ -71,7 +79,7 @@ def hybrid_rrf_search(query, chunks, top_k=3, k=60):
 def generate_llm_answer(query, context, hf_api_key=""):
     """Generates an answer using Hugging Face Inference API or falls back to extractive response."""
     
-    # Safely check Streamlit Secrets without crashing when running locally
+    # Safely check Streamlit Secrets without crashing on local environments
     if not hf_api_key:
         try:
             if "HF_API_KEY" in st.secrets:
