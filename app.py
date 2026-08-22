@@ -19,6 +19,7 @@ st.caption("Powered by BM25 + FAISS Vector Search, LLM Generation & Citation Val
 
 @st.cache_resource
 def load_embedder():
+    # BAAI/bge-small-en-v1.5 model for dense embeddings
     return SentenceTransformer("BAAI/bge-small-en-v1.5")
 
 embedder = load_embedder()
@@ -27,23 +28,19 @@ embedder = load_embedder()
 # 2. HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def clean_extracted_text(text):
-    """Normalizes unicode and removes non-printable / replacement character artifacts."""
+    """Normalizes unicode and strips unprintable/corrupt byte replacement artifacts."""
     if not text:
         return ""
-    # Normalize unicode representations
     normalized = unicodedata.normalize("NFKD", text)
-    # Strip non-printable bytes and replacement symbols (\ufffd / diamond ?)
     cleaned = "".join(ch for ch in normalized if ch.isprintable() or ch in ['\n', ' '])
     return cleaned.replace("\ufffd", "").replace("", "").strip()
 
 def parse_and_chunk_pdf(uploaded_file, chunk_size=512, chunk_overlap=64):
     """
-    Extracts text using pdfplumber to bypass font CMap errors.
-    Falls back to PyMuPDF with text cleaning if pdfplumber returns empty content.
+    Extracts text using pdfplumber to bypass font CMap encoding issues.
+    Falls back to PyMuPDF with text sanitization if pdfplumber yields empty output.
     """
     chunks = []
-    
-    # Reset stream pointer
     uploaded_file.seek(0)
     
     # Primary Method: pdfplumber
@@ -90,6 +87,7 @@ def parse_and_chunk_pdf(uploaded_file, chunk_size=512, chunk_overlap=64):
     return chunks
 
 def hybrid_rrf_search(query, chunks, top_k=3, k=60):
+    """Combines BM25 (Sparse) and Dense Vector Search via Reciprocal Rank Fusion."""
     corpus_texts = [c["text"] for c in chunks]
     
     # Sparse BM25 Search
@@ -115,10 +113,17 @@ def hybrid_rrf_search(query, chunks, top_k=3, k=60):
     return [chunks[idx] for idx, score in sorted_indices]
 
 def generate_llm_answer(query, context, hf_api_key=""):
-    if not hf_api_key and "HF_API_KEY" in st.secrets:
-        hf_api_key = st.secrets["HF_API_KEY"]
+    """Generates response via Hugging Face API or uses an extractive fallback."""
+    
+    # Safely evaluate st.secrets without crashing on local execution
+    if not hf_api_key:
+        try:
+            if "HF_API_KEY" in st.secrets:
+                hf_api_key = st.secrets["HF_API_KEY"]
+        except Exception:
+            pass
 
-    if hf_api_key.strip():
+    if hf_api_key and hf_api_key.strip():
         API_URL = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
         headers = {"Authorization": f"Bearer {hf_api_key.strip()}"}
         
@@ -141,8 +146,9 @@ Question: {query} [/INST]"""
                 if isinstance(result, list) and "generated_text" in result[0]:
                     return result[0]["generated_text"].split("[/INST]")[-1].strip()
         except Exception:
-            pass
+            pass  # Fall back to rule-based synthesis on timeout or error
 
+    # Local Extractive Fallback Engine
     sentences = [s.strip() for s in context.split('.') if len(s.strip()) > 10]
     top_sentences = sentences[:3] if len(sentences) >= 3 else sentences
     return f"Based on the retrieved context: {' '.join(top_sentences)}."
@@ -162,25 +168,29 @@ if uploaded_file:
         if len(chunks) > 0:
             st.sidebar.success(f"Successfully indexed {len(chunks)} text chunks!")
         else:
-            st.sidebar.error("Could not extract readable text. Document might be scanned or image-only.")
+            st.sidebar.error("Could not extract readable text. The document might be scanned or image-only.")
 
     query = st.text_input("Enter your question about the document:")
     
     if query and len(chunks) > 0:
+        # Step 1: Search relevant chunks
         retrieved_chunks = hybrid_rrf_search(query, chunks, top_k=3)
         best_context = retrieved_chunks[0]['text']
         
+        # Step 2: Answer generation
         with st.spinner("Generating answer..."):
             generated_answer = generate_llm_answer(query, best_context, hf_api_key)
         
         st.subheader("🤖 Generated Answer")
         st.info(generated_answer)
         
+        # Step 3: Context & Citations
         st.subheader("🔍 Retrieved Citations & Context")
         for idx, chunk in enumerate(retrieved_chunks):
             with st.expander(f"Source Chunk #{idx+1} (Page {chunk['page']})", expanded=(idx == 0)):
                 st.write(chunk['text'])
         
+        # Step 4: Metric Evaluations
         scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
         rouge_l = scorer.score(best_context, generated_answer)['rougeL'].fmeasure
         
